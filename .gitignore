@@ -1,0 +1,9 @@
+.build/
+.swiftpm/
+DerivedData/
+dist/
+Support/del-is-archive.icns
+
+.DS_Store
+*.xcuserstate
+*.xcworkspace
