@@ -53,7 +53,7 @@ macOS needs permission before this can work:
 - Accessibility: required for the event tap and focused-element checks.
 - Automation: required when the app triggers Mail's `Message > Archive` command through System Events.
 
-The About window shows whether Accessibility is enabled and includes a button to open the right System Settings pane.
+If Accessibility or Automation is not enabled, the app opens About instead of prompting at startup. About shows the current permission status and includes buttons to start each enable flow and open the right System Settings pane. The Accessibility enable flow resets this app's existing Accessibility entry first, which helps clear stale permissions after reinstalling or rebuilding.
 
 ## Behavior
 

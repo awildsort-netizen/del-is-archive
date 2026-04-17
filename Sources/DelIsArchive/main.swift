@@ -8,13 +8,57 @@ private enum KeyCode {
 }
 
 private enum AccessibilityPermission {
+    private static let fallbackBundleIdentifier = "com.awildsort.del-is-archive"
+
     static var isEnabled: Bool {
         AXIsProcessTrusted()
     }
 
     static func request() {
-        let options = [kAXTrustedCheckOptionPrompt.takeRetainedValue() as String: true] as CFDictionary
+        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
         _ = AXIsProcessTrustedWithOptions(options)
+    }
+
+    static func resetCurrentAppAuthorization() -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
+        process.arguments = [
+            "reset",
+            "Accessibility",
+            Bundle.main.bundleIdentifier ?? fallbackBundleIdentifier
+        ]
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+            return process.terminationStatus == 0
+        } catch {
+            NSLog("Del is Archive could not reset Accessibility permission: %@", error.localizedDescription)
+            return false
+        }
+    }
+}
+
+private enum AutomationPermission {
+    private static let systemEventsBundleIdentifier = "com.apple.systemevents"
+
+    static var isEnabled: Bool {
+        authorizationStatus(askUserIfNeeded: false) == noErr
+    }
+
+    static func request() {
+        _ = authorizationStatus(askUserIfNeeded: true)
+    }
+
+    private static func authorizationStatus(askUserIfNeeded: Bool) -> OSStatus {
+        let target = NSAppleEventDescriptor(bundleIdentifier: systemEventsBundleIdentifier)
+
+        return AEDeterminePermissionToAutomateTarget(
+            target.aeDesc,
+            typeWildCard,
+            typeWildCard,
+            askUserIfNeeded
+        )
     }
 }
 
@@ -32,27 +76,38 @@ private enum LoginItem {
     }
 }
 
-private final class DelIsArchiveApp: NSObject, NSApplicationDelegate {
+private final class DelIsArchiveApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private static let appName = "Del is Archive"
     private static let defaultStatusTitle = "Del is Archive"
     private static let successStatusTitle = "Archive successful"
     private static let animateSuccessKey = "AnimateSuccessIcon"
 
-    private lazy var interceptor = MailArchiveInterceptor { [weak self] in
-        self?.showArchiveSuccess()
-    }
+    private lazy var interceptor = MailArchiveInterceptor(
+        onArchiveSuccess: { [weak self] in
+            self?.showArchiveSuccess()
+        },
+        onAutomationPermissionNeeded: { [weak self] in
+            self?.showAbout()
+        }
+    )
 
     private var statusItem: NSStatusItem?
     private var aboutWindow: NSWindow?
     private var resetStatusTitleWorkItem: DispatchWorkItem?
-    private var successAnimationWorkItems: [DispatchWorkItem] = []
+    private var permissionPollTimer: Timer?
+    private var lastRenderedPermissionSignature: String?
+    private var isShowingArchiveSuccess = false
+    private var lastInterceptorStartAttempt: Date?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         UserDefaults.standard.register(defaults: [Self.animateSuccessKey: true])
         configureStatusItem()
         observeFrontmostApplicationChanges()
         updateStatusItemVisibility()
-        interceptor.start()
+        let didStartInterceptor = startInterceptorIfPermitted()
+        if !didStartInterceptor || !isAutomationReady {
+            showAbout()
+        }
     }
 
     private func configureStatusItem() {
@@ -77,33 +132,39 @@ private final class DelIsArchiveApp: NSObject, NSApplicationDelegate {
     }
 
     private func updateStatusItemVisibility() {
-        statusItem?.isVisible = NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.apple.mail"
+        statusItem?.isVisible = isShowingArchiveSuccess
+            || NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.apple.mail"
     }
 
     @objc private func showAbout() {
+        refreshPermissionState()
+
         let window = aboutWindow ?? makeAboutWindow()
         window.contentView = makeAboutContentView()
         aboutWindow = window
+        lastRenderedPermissionSignature = permissionSignature
 
         NSApplication.shared.activate(ignoringOtherApps: true)
         window.center()
         window.makeKeyAndOrderFront(nil)
+        startPermissionPolling()
     }
 
     private func makeAboutWindow() -> NSWindow {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 420, height: 360),
+            contentRect: NSRect(x: 0, y: 0, width: 420, height: 420),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
         )
         window.title = Self.appName
         window.isReleasedWhenClosed = false
+        window.delegate = self
         return window
     }
 
     private func makeAboutContentView() -> NSView {
-        let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 420, height: 360))
+        let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 420, height: 420))
 
         let root = NSStackView()
         root.orientation = .vertical
@@ -160,12 +221,47 @@ private final class DelIsArchiveApp: NSObject, NSApplicationDelegate {
     }
 
     private func makePermissionSection() -> NSView {
-        let enabled = AccessibilityPermission.isEnabled
-        let symbolName = enabled ? "checkmark.circle.fill" : "exclamationmark.triangle.fill"
-        let title = enabled ? "Accessibility is enabled" : "Accessibility needs permission"
-        let detail = enabled
-            ? "Keyboard interception and focused-element checks can run."
-            : "Enable Accessibility so Del is Archive can listen for Delete in Mail."
+        let section = NSStackView()
+        section.orientation = .vertical
+        section.alignment = .leading
+        section.spacing = 8
+        section.addArrangedSubview(makeSectionTitle("Permissions"))
+
+        section.addArrangedSubview(makePermissionRow(
+            isEnabled: isAccessibilityReady,
+            enabledTitle: "Accessibility is enabled",
+            disabledTitle: "Accessibility needs permission",
+            enabledDetail: "Keyboard interception and focused-element checks can run.",
+            disabledDetail: "Enable Accessibility so Del is Archive can listen for Delete in Mail.",
+            buttonTitle: "Enable Accessibility...",
+            action: #selector(requestAccessibilityPermissionFromAbout)
+        ))
+
+        section.addArrangedSubview(makePermissionRow(
+            isEnabled: isAutomationReady,
+            enabledTitle: "Automation is enabled",
+            disabledTitle: "Automation needs permission",
+            enabledDetail: "The archive AppleScript can ask System Events to click Mail's Archive command.",
+            disabledDetail: "Enable Automation so Del is Archive can run Mail's Archive command.",
+            buttonTitle: "Enable Automation...",
+            action: #selector(requestAutomationPermissionFromAbout)
+        ))
+
+        return section
+    }
+
+    private func makePermissionRow(
+        isEnabled: Bool,
+        enabledTitle: String,
+        disabledTitle: String,
+        enabledDetail: String,
+        disabledDetail: String,
+        buttonTitle: String,
+        action: Selector
+    ) -> NSView {
+        let symbolName = isEnabled ? "checkmark.circle.fill" : "exclamationmark.triangle.fill"
+        let title = isEnabled ? enabledTitle : disabledTitle
+        let detail = isEnabled ? enabledDetail : disabledDetail
 
         let icon = NSImageView()
         icon.image = statusImage(named: symbolName, description: title, pointSize: 18)
@@ -181,7 +277,7 @@ private final class DelIsArchiveApp: NSObject, NSApplicationDelegate {
         let detailLabel = NSTextField(wrappingLabelWithString: detail)
         detailLabel.font = NSFont.systemFont(ofSize: 12)
         detailLabel.textColor = .secondaryLabelColor
-        detailLabel.maximumNumberOfLines = 2
+        detailLabel.maximumNumberOfLines = 3
 
         let labels = NSStackView(views: [titleLabel, detailLabel])
         labels.orientation = .vertical
@@ -193,19 +289,18 @@ private final class DelIsArchiveApp: NSObject, NSApplicationDelegate {
         row.alignment = .top
         row.spacing = 8
 
-        let section = NSStackView()
-        section.orientation = .vertical
-        section.alignment = .leading
-        section.spacing = 8
-        section.addArrangedSubview(makeSectionTitle("Permissions"))
-        section.addArrangedSubview(row)
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 6
+        stack.addArrangedSubview(row)
 
-        if !enabled {
-            let button = NSButton(title: "Enable Accessibility...", target: self, action: #selector(requestAccessibilityPermissionFromAbout))
-            section.addArrangedSubview(button)
+        if !isEnabled {
+            let button = NSButton(title: buttonTitle, target: self, action: action)
+            stack.addArrangedSubview(button)
         }
 
-        return section
+        return stack
     }
 
     private func makeSettingsSection() -> NSView {
@@ -259,15 +354,34 @@ private final class DelIsArchiveApp: NSObject, NSApplicationDelegate {
     }
 
     @objc private func requestAccessibilityPermissionFromAbout() {
+        interceptor.stop()
+        lastInterceptorStartAttempt = nil
+        if !AccessibilityPermission.resetCurrentAppAuthorization() {
+            NSLog("Del is Archive could not reset Accessibility permission with tccutil.")
+        }
         AccessibilityPermission.request()
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
             NSWorkspace.shared.open(url)
         }
-        aboutWindow?.contentView = makeAboutContentView()
+        refreshPermissionState()
+        startPermissionPolling()
+    }
+
+    @objc private func requestAutomationPermissionFromAbout() {
+        AutomationPermission.request()
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation") {
+            NSWorkspace.shared.open(url)
+        }
+        refreshPermissionState()
+        startPermissionPolling()
     }
 
     @objc private func closeAbout() {
         aboutWindow?.close()
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        stopPermissionPolling()
     }
 
     @objc private func quitFromAbout() {
@@ -299,15 +413,21 @@ private final class DelIsArchiveApp: NSObject, NSApplicationDelegate {
         resetStatusTitleWorkItem?.cancel()
         cancelSuccessAnimation()
 
+        isShowingArchiveSuccess = true
+        updateStatusItemVisibility()
+
         if animateSuccessIcon {
             animateThumbsUp()
         } else {
-            configureStatusButton(symbolName: "hand.thumbsup.fill", fallbackTitle: Self.successStatusTitle, description: "Archive successful")
+            configureSuccessStatusButton(symbolName: "hand.thumbsup.fill")
         }
 
         let reset = DispatchWorkItem { [weak self] in
             self?.cancelSuccessAnimation()
+            self?.isShowingArchiveSuccess = false
+            self?.statusItem?.length = NSStatusItem.variableLength
             self?.configureStatusButton(symbolName: "archivebox", fallbackTitle: Self.defaultStatusTitle, description: Self.appName)
+            self?.updateStatusItemVisibility()
         }
 
         resetStatusTitleWorkItem = reset
@@ -319,31 +439,22 @@ private final class DelIsArchiveApp: NSObject, NSApplicationDelegate {
     }
 
     private func animateThumbsUp() {
-        let frames: [(delay: TimeInterval, pointSize: CGFloat)] = [
-            (0.00, 13),
-            (0.08, 18),
-            (0.16, 15),
-            (0.24, 17),
-            (0.32, 15)
-        ]
+        guard let button = statusItem?.button else {
+            configureSuccessStatusButton(symbolName: "hand.thumbsup.fill")
+            return
+        }
 
-        successAnimationWorkItems = frames.map { frame in
-            let workItem = DispatchWorkItem { [weak self] in
-                self?.configureStatusButton(
-                    symbolName: "hand.thumbsup.fill",
-                    fallbackTitle: Self.successStatusTitle,
-                    description: "Archive successful",
-                    pointSize: frame.pointSize
-                )
-            }
-            DispatchQueue.main.asyncAfter(deadline: .now() + frame.delay, execute: workItem)
-            return workItem
+        button.alphaValue = 0.35
+        configureSuccessStatusButton(symbolName: "hand.thumbsup.fill")
+
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.18
+            button.animator().alphaValue = 1
         }
     }
 
     private func cancelSuccessAnimation() {
-        successAnimationWorkItems.forEach { $0.cancel() }
-        successAnimationWorkItems.removeAll()
+        statusItem?.button?.alphaValue = 1
     }
 
     private func configureStatusButton(symbolName: String, fallbackTitle: String, description: String) {
@@ -355,6 +466,8 @@ private final class DelIsArchiveApp: NSObject, NSApplicationDelegate {
             return
         }
 
+        button.font = NSFont.systemFont(ofSize: 13)
+
         if let image = statusImage(named: symbolName, description: description, pointSize: pointSize) {
             button.title = ""
             button.image = image
@@ -363,6 +476,28 @@ private final class DelIsArchiveApp: NSObject, NSApplicationDelegate {
             button.image = nil
             button.title = fallbackTitle
         }
+        button.needsDisplay = true
+    }
+
+    private func configureSuccessStatusButton(symbolName: String) {
+        statusItem?.length = NSStatusItem.variableLength
+
+        guard let button = statusItem?.button else {
+            return
+        }
+
+        button.title = ""
+        button.font = NSFont.systemFont(ofSize: 13)
+
+        if let image = statusImage(named: symbolName, description: "Archive successful", pointSize: 15) {
+            button.image = image
+            button.imagePosition = .imageOnly
+        } else {
+            button.image = nil
+            button.title = Self.successStatusTitle
+        }
+
+        button.needsDisplay = true
     }
 
     private func statusImage(named symbolName: String, description: String, pointSize: CGFloat) -> NSImage? {
@@ -372,19 +507,84 @@ private final class DelIsArchiveApp: NSObject, NSApplicationDelegate {
         image?.isTemplate = true
         return image
     }
+
+    private func startInterceptorIfPermitted() -> Bool {
+        guard shouldAttemptInterceptorStart else {
+            return false
+        }
+
+        lastInterceptorStartAttempt = Date()
+        return interceptor.start()
+    }
+
+    private func refreshPermissionState() {
+        _ = startInterceptorIfPermitted()
+
+        let signature = permissionSignature
+        guard lastRenderedPermissionSignature != signature else {
+            return
+        }
+
+        lastRenderedPermissionSignature = signature
+        aboutWindow?.contentView = makeAboutContentView()
+    }
+
+    private func startPermissionPolling() {
+        guard permissionPollTimer == nil else {
+            return
+        }
+
+        permissionPollTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            self?.refreshPermissionState()
+        }
+    }
+
+    private func stopPermissionPolling() {
+        permissionPollTimer?.invalidate()
+        permissionPollTimer = nil
+    }
+
+    private var isAccessibilityReady: Bool {
+        AccessibilityPermission.isEnabled || interceptor.isStarted
+    }
+
+    private var isAutomationReady: Bool {
+        AutomationPermission.isEnabled
+    }
+
+    private var permissionSignature: String {
+        "\(isAccessibilityReady)-\(isAutomationReady)"
+    }
+
+    private var shouldAttemptInterceptorStart: Bool {
+        if isAccessibilityReady {
+            return true
+        }
+
+        guard let lastInterceptorStartAttempt else {
+            return true
+        }
+
+        return Date().timeIntervalSince(lastInterceptorStartAttempt) > 2
+    }
 }
 
 private final class MailArchiveInterceptor {
     private let onArchiveSuccess: () -> Void
+    private let onAutomationPermissionNeeded: () -> Void
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
+    private(set) var isStarted = false
 
-    init(onArchiveSuccess: @escaping () -> Void) {
+    init(onArchiveSuccess: @escaping () -> Void, onAutomationPermissionNeeded: @escaping () -> Void) {
         self.onArchiveSuccess = onArchiveSuccess
+        self.onAutomationPermissionNeeded = onAutomationPermissionNeeded
     }
 
-    func start() {
-        requestAccessibilityIfNeeded()
+    func start() -> Bool {
+        guard !isStarted else {
+            return true
+        }
 
         let keyDownMask = CGEventMask(1 << CGEventType.keyDown.rawValue)
         guard let tap = CGEvent.tapCreate(
@@ -395,8 +595,8 @@ private final class MailArchiveInterceptor {
             callback: eventTapCallback,
             userInfo: UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
         ) else {
-            showStartupFailure()
-            return
+            NSLog("Del is Archive could not create keyboard event tap.")
+            return false
         }
 
         eventTap = tap
@@ -407,18 +607,8 @@ private final class MailArchiveInterceptor {
         }
 
         CGEvent.tapEnable(tap: tap, enable: true)
-    }
-
-    private func requestAccessibilityIfNeeded() {
-        AccessibilityPermission.request()
-    }
-
-    private func showStartupFailure() {
-        let alert = NSAlert()
-        alert.messageText = "Del is Archive could not listen for keyboard events."
-        alert.informativeText = "Open System Settings > Privacy & Security > Accessibility and allow this app or the Terminal process that launched it, then restart the app."
-        alert.alertStyle = .warning
-        alert.runModal()
+        isStarted = true
+        return true
     }
 
     fileprivate func handle(event: CGEvent) -> Unmanaged<CGEvent>? {
@@ -443,6 +633,21 @@ private final class MailArchiveInterceptor {
         if let eventTap {
             CGEvent.tapEnable(tap: eventTap, enable: true)
         }
+    }
+
+    fileprivate func stop() {
+        if let runLoopSource {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), runLoopSource, .commonModes)
+        }
+
+        if let eventTap {
+            CGEvent.tapEnable(tap: eventTap, enable: false)
+            CFMachPortInvalidate(eventTap)
+        }
+
+        runLoopSource = nil
+        eventTap = nil
+        isStarted = false
     }
 
     private func isPlainDelete(_ event: CGEvent) -> Bool {
@@ -481,6 +686,10 @@ private final class MailArchiveInterceptor {
             appleScript.executeAndReturnError(&error)
             if let error {
                 NSLog("Del is Archive AppleScript error: %@", error)
+                if let errorNumber = error[NSAppleScript.errorNumber] as? NSNumber,
+                   errorNumber.int32Value == Int32(errAEEventNotPermitted) {
+                    self.onAutomationPermissionNeeded()
+                }
             } else {
                 self.onArchiveSuccess()
             }
